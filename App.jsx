@@ -41,8 +41,8 @@ const LOGO_B64 =
 // real dentro de la colección "datos", con un único campo de texto que
 // guarda toda la información en formato JSON, igual que antes.
 // ---------------------------------------------------------------------------
-const FIREBASE_PROJECT_ID = "eljaralillo-2f879";
-const FIREBASE_API_KEY = "AIzaSyBmFPlT3Zq8A0gKyx5ivK94VCZu85MVHNI";
+const FIREBASE_PROJECT_ID = import.meta.env.VITE_FIREBASE_PROJECT_ID;
+const FIREBASE_API_KEY = import.meta.env.VITE_FIREBASE_API_KEY;
 const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/datos`;
 
 async function loadShared(key, fallback) {
