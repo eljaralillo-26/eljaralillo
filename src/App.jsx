@@ -1603,10 +1603,31 @@ function BotonGrabar({ onGrabado }) {
   const [segundos, setSegundos] = useState(0);
   const [error, setError] = useState("");
   const mediaRecorderRef = useRef(null);
+  const streamRef = useRef(null);
   const chunksRef = useRef([]);
   const segundosRef = useRef(0);
   const intervaloRef = useRef(null);
   const MAX_SEG = 45;
+
+  // Muy importante: si el agricultor/puesto cambia de pantalla con el
+  // micrófono todavía grabando, hay que soltarlo aquí — si no, el
+  // navegador lo deja "ocupado" y la siguiente grabación (en cualquier
+  // zona) deja de funcionar.
+  useEffect(() => {
+    return () => {
+      if (intervaloRef.current) clearInterval(intervaloRef.current);
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {
+          // ya estaba parado, no pasa nada
+        }
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+    };
+  }, []);
 
   const detener = () => {
     if (intervaloRef.current) clearInterval(intervaloRef.current);
@@ -1624,6 +1645,7 @@ function BotonGrabar({ onGrabado }) {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
       chunksRef.current = [];
       segundosRef.current = 0;
       const mr = new MediaRecorder(stream);
@@ -1633,7 +1655,11 @@ function BotonGrabar({ onGrabado }) {
       };
       mr.onstop = () => {
         stream.getTracks().forEach((t) => t.stop());
-        if (chunksRef.current.length === 0) return;
+        streamRef.current = null;
+        if (chunksRef.current.length === 0) {
+          setError("No se ha grabado nada — mantén pulsado un poco más antes de parar.");
+          return;
+        }
         const blob = new Blob(chunksRef.current, { type: mr.mimeType || "audio/webm" });
         const lector = new FileReader();
         lector.onload = () => onGrabado(lector.result, segundosRef.current);
