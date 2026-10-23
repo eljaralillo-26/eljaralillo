@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import * as XLSX from "xlsx";
+import { pedirPermisoYObtenerToken } from "./notificaciones.js";
 import { Leaf, Stamp, Bell, LogOut, ShieldCheck, Clock, Coins, ChevronRight, Send, X, Loader2, Upload, Download, CheckCircle2, AlertTriangle, UserPlus, Scale, ArrowRight, FileText, PenTool, Eraser, RotateCcw, Mic, Package, MessageCircle, Pin, User, Droplet, KeyRound, Users, ClipboardList, RefreshCw } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -43,7 +44,83 @@ const LOGO_B64 =
 // ---------------------------------------------------------------------------
 const FIREBASE_PROJECT_ID = import.meta.env.VITE_FIREBASE_PROJECT_ID;
 const FIREBASE_API_KEY = import.meta.env.VITE_FIREBASE_API_KEY;
+const FIREBASE_STORAGE_BUCKET = import.meta.env.VITE_FIREBASE_STORAGE_BUCKET;
+
+// Los archivos grandes de verdad (PDF de facturas) van al "almacén de
+// archivos" de Firebase (Storage), no a la base de datos — ahí no hay
+// límite de 1 MB, admite archivos de muchos MB sin problema.
+async function subirArchivoStorage(ruta, file) {
+  try {
+    const res = await fetch(
+      `https://firebasestorage.googleapis.com/v0/b/${FIREBASE_STORAGE_BUCKET}/o?uploadType=media&name=${encodeURIComponent(ruta)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": file.type || "application/pdf" },
+        body: file,
+      }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const token = data.downloadTokens;
+    return `https://firebasestorage.googleapis.com/v0/b/${FIREBASE_STORAGE_BUCKET}/o/${encodeURIComponent(ruta)}?alt=media${
+      token ? `&token=${token}` : ""
+    }`;
+  } catch {
+    return null;
+  }
+}
 const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/datos`;
+const FIRESTORE_ROOT = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+
+// Los mensajes del chat se guardan CADA UNO en su propia ficha (dentro de
+// la colección "mensajes"), en vez de todos juntos en una sola — así no
+// hay un límite de tamaño combinado entre todos los mensajes de todo el
+// mundo, como sí pasaba antes (por eso fallaba el segundo audio).
+async function listarMensajesRemotos() {
+  try {
+    const res = await fetch(`${FIRESTORE_ROOT}/mensajes?pageSize=300&key=${FIREBASE_API_KEY}`);
+    if (!res.ok) return { hay: false };
+    const data = await res.json();
+    const docs = data.documents || [];
+    const mensajes = docs
+      .map((d) => {
+        const raw = d.fields?.valor?.stringValue;
+        return raw ? JSON.parse(raw) : null;
+      })
+      .filter(Boolean);
+    return { hay: true, value: mensajes };
+  } catch {
+    return { hay: false };
+  }
+}
+
+async function guardarMensajeRemoto(mensaje) {
+  try {
+    const cuerpo = { fields: { valor: { stringValue: JSON.stringify(mensaje) } } };
+    const res = await fetch(
+      `${FIRESTORE_ROOT}/mensajes/${encodeURIComponent(String(mensaje.id))}?key=${FIREBASE_API_KEY}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cuerpo),
+      }
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function borrarMensajeRemoto(id) {
+  try {
+    await fetch(`${FIRESTORE_ROOT}/mensajes/${encodeURIComponent(String(id))}?key=${FIREBASE_API_KEY}`, {
+      method: "DELETE",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function loadShared(key, fallback) {
   try {
@@ -96,14 +173,34 @@ async function saveShared(key, value) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cuerpo),
     });
-    return res.ok;
-  } catch {
+    if (!res.ok) {
+      let detalle = "";
+      try {
+        const cuerpoError = await res.json();
+        detalle = cuerpoError?.error?.message || "";
+      } catch {
+        // no había cuerpo JSON legible
+      }
+      console.error("Fallo al guardar en Firestore:", key, res.status, detalle);
+      saveShared.ultimoError = `${res.status}: ${detalle}`;
+      return false;
+    }
+    return true;
+  } catch (err) {
     // demo: si falla el guardado, seguimos en memoria
+    console.error("Fallo de red al guardar en Firestore:", key, err);
+    saveShared.ultimoError = String(err?.message || err);
     return false;
   }
 }
 
 function descargarDataUrl(dataUrl, nombreArchivo) {
+  // Si ya es un enlace real (subido a Firebase Storage), se abre tal cual —
+  // no hace falta convertir nada, el navegador ya sabe descargarlo/verlo.
+  if (/^https?:\/\//.test(dataUrl)) {
+    window.open(dataUrl, "_blank");
+    return;
+  }
   try {
     const partes = dataUrl.split(",");
     const mimeMatch = partes[0].match(/:(.*?);/);
@@ -132,6 +229,22 @@ function descargarDataUrl(dataUrl, nombreArchivo) {
   } catch {
     // último recurso: abrir el data URL tal cual
     window.open(dataUrl, "_blank");
+  }
+}
+
+// Llama al "mensajero" (una función aparte, con permiso especial) para
+// que mande de verdad la notificación a los móviles indicados. Si falla,
+// no rompe nada más de la app — el aviso ya se guardó igualmente.
+async function enviarPush(tokens, titulo, mensaje) {
+  if (!tokens || tokens.length === 0) return;
+  try {
+    await fetch("/.netlify/functions/enviar-notificacion", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tokens, titulo, mensaje }),
+    });
+  } catch {
+    // si falla el envío del aviso, no rompemos el resto de la app
   }
 }
 
@@ -181,9 +294,9 @@ function localizarTablaGuia(wb) {
     const filas = XLSX.utils.sheet_to_json(hoja, { header: 1, defval: "" });
 
     for (let i = 0; i < Math.min(filas.length, 25); i++) {
-      const filaTexto = filas[i].map((c) => String(c || "").toLowerCase());
-      const tieneDni = filaTexto.some((c) => c.includes("dni"));
-      const tieneKilos = filaTexto.some((c) => c.includes("kilo"));
+      const filaTexto = filas[i].map((c) => String(c || "").trim().toLowerCase());
+      const tieneDni = filaTexto.some((c) => c.length <= 25 && c.includes("dni"));
+      const tieneKilos = filaTexto.some((c) => c.length <= 25 && c.includes("kilo"));
       if (!tieneDni || !tieneKilos) continue;
 
       const headersReales = filas[i].map((c) => String(c || "").trim());
@@ -234,7 +347,7 @@ export default function App() {
   const [avisos, setAvisos] = useState([]);
   const [mensajes, setMensajes] = useState([]);
   const [perfiles, setPerfiles] = useState({});
-  const [codigo, setCodigo] = useState("07");
+  const [codigosRegistro, setCodigosRegistro] = useState({});
   const [presencia, setPresencia] = useState({});
   const [precios, setPrecios] = useState({ garrafa: 15, caja: 48 });
   const [pedidos, setPedidos] = useState([]);
@@ -261,9 +374,10 @@ export default function App() {
       const ag = await loadShared("jaralillo-agricultores", SEED_AGRICULTORES);
       const a = await loadShared("jaralillo-albaranes", SEED_ALBARANES);
       const av = await loadShared("jaralillo-avisos", []);
-      const ch = await loadShared("jaralillo-chat", []);
+      const ch = await listarMensajesRemotos();
+      const chVal = ch.hay ? ch.value : [];
       const pf = await loadShared("jaralillo-perfiles", {});
-      const co = await loadShared("jaralillo-codigo", "07");
+      const cr = await loadShared("jaralillo-codigos-registro", {});
       const pr = await loadShared("jaralillo-presencia", {});
       const pc = await loadShared("jaralillo-precios", { garrafa: 15, caja: 48 });
       const pd = await loadShared("jaralillo-pedidos", []);
@@ -274,9 +388,9 @@ export default function App() {
       setAgricultores(ag);
       setAlbaranes(a);
       setAvisos(av);
-      setMensajes(ch);
+      setMensajes(chVal);
       setPerfiles(pf);
-      setCodigo(co);
+      setCodigosRegistro(cr);
       setPresencia(pr);
       setPrecios(pc);
       setPedidos(pd);
@@ -285,7 +399,7 @@ export default function App() {
       setPendientes(pend);
       setFacturas(fact);
       avisosCountRef.current = av.length;
-      mensajesCountRef.current = ch.length;
+      mensajesCountRef.current = chVal.length;
       agricultoresCountRef.current = Object.keys(ag).length;
       setReady(true);
     })();
@@ -327,6 +441,9 @@ export default function App() {
 
         const fact = await pollShared("jaralillo-facturas-index");
         if (fact.hay) setFacturas(fact.value);
+
+        const pd = await pollShared("jaralillo-pedidos");
+        if (pd.hay) setPedidos(pd.value);
       }
 
       const av = await pollShared("jaralillo-avisos");
@@ -349,10 +466,11 @@ export default function App() {
         avisosCountRef.current = av.value.length;
       }
 
-      const ch = await pollShared("jaralillo-chat");
+      const ch = await listarMensajesRemotos();
       if (ch.hay) {
-        if (ch.value.length > mensajesCountRef.current) {
-          const ultimo = ch.value[ch.value.length - 1];
+        const ordenados = [...ch.value].sort((a, b) => (a.ts || a.id) - (b.ts || b.id));
+        if (ordenados.length > mensajesCountRef.current) {
+          const ultimo = ordenados[ordenados.length - 1];
           const s = sesionRef.current;
           const vAhora = vistaRef.current;
           const esAgricultorViendo = vAhora === "agricultor" && s && ultimo.dni !== s;
@@ -360,9 +478,9 @@ export default function App() {
           if (esAgricultorViendo || esPuestoViendo) {
             setNotiToast({ tipo: "mensaje", texto: `${ultimo.nombre} (Whatsapillo): ${ultimo.texto}` });
           }
-          setMensajes(ch.value);
+          setMensajes(ordenados);
         }
-        mensajesCountRef.current = ch.value.length;
+        mensajesCountRef.current = ordenados.length;
       }
     }, 10000);
     return () => clearInterval(id);
@@ -382,14 +500,33 @@ export default function App() {
     });
   }, []);
 
+  const activarNotificaciones = useCallback(async (dniPersona) => {
+    const resultado = await pedirPermisoYObtenerToken();
+    if (!resultado.ok) return resultado;
+    const actual = await loadShared("jaralillo-tokens", {});
+    const lista = actual[dniPersona] || [];
+    if (!lista.includes(resultado.token)) lista.push(resultado.token);
+    const nuevo = { ...actual, [dniPersona]: lista };
+    await saveShared("jaralillo-tokens", nuevo);
+    return { ok: true };
+  }, []);
+
   const publicarAviso = useCallback(
     async (aviso) => {
       const nuevo = [{ ...aviso, id: Date.now(), ts: Date.now() }, ...avisos];
       setAvisos(nuevo);
       avisosCountRef.current = nuevo.length;
       await saveShared("jaralillo-avisos", nuevo);
+
+      // Manda la notificación push a quien corresponda, sin bloquear
+      // el resto de la app si tarda o falla.
+      const tokensGuardados = await loadShared("jaralillo-tokens", {});
+      const destinatariosDni =
+        aviso.destinatarios === "todos" ? Object.keys(agricultores) : aviso.destinatarios || [];
+      const tokens = destinatariosDni.flatMap((dni) => tokensGuardados[dni] || []);
+      enviarPush(tokens, "Nuevo aviso de El Jaralillo", aviso.mensaje);
     },
-    [avisos]
+    [avisos, agricultores]
   );
 
   const eliminarAviso = useCallback(
@@ -404,23 +541,32 @@ export default function App() {
 
   const enviarMensaje = useCallback(
     async (autorDni, autorNombre, texto, audioUrl, duracion) => {
-      const nuevo = [
-        ...mensajes,
-        {
-          id: Date.now(),
-          dni: autorDni,
-          nombre: autorNombre,
-          texto: texto || "",
-          audioUrl: audioUrl || null,
-          duracion: duracion || null,
-          ts: Date.now(),
-        },
-      ];
+      const mensajeNuevo = {
+        id: Date.now(),
+        dni: autorDni,
+        nombre: autorNombre,
+        texto: texto || "",
+        audioUrl: audioUrl || null,
+        duracion: duracion || null,
+        ts: Date.now(),
+      };
+      const nuevo = [...mensajes, mensajeNuevo];
       setMensajes(nuevo);
       mensajesCountRef.current = nuevo.length;
-      await saveShared("jaralillo-chat", nuevo);
+      const ok = await guardarMensajeRemoto(mensajeNuevo);
+
+      // Avisa a todo el mundo menos a quien acaba de escribir.
+      const tokensGuardados = await loadShared("jaralillo-tokens", {});
+      const destinatariosDni = [PUESTO_DNI, ...Object.keys(agricultores)].filter(
+        (dni) => dni !== autorDni
+      );
+      const tokens = destinatariosDni.flatMap((dni) => tokensGuardados[dni] || []);
+      const textoAviso = audioUrl ? "Nota de voz" : texto;
+      enviarPush(tokens, `${autorNombre} (Whatsapillo)`, textoAviso);
+
+      return { ok };
     },
-    [mensajes]
+    [mensajes, agricultores]
   );
 
   const eliminarMensaje = useCallback(
@@ -428,7 +574,7 @@ export default function App() {
       const nuevo = mensajes.filter((m) => m.id !== id);
       setMensajes(nuevo);
       mensajesCountRef.current = nuevo.length;
-      await saveShared("jaralillo-chat", nuevo);
+      await borrarMensajeRemoto(id);
     },
     [mensajes]
   );
@@ -438,8 +584,12 @@ export default function App() {
       const nuevo = { ...perfiles, [dniReg]: { pin } };
       setPerfiles(nuevo);
       await saveShared("jaralillo-perfiles", nuevo);
+      const nuevosCodigos = { ...codigosRegistro };
+      delete nuevosCodigos[dniReg];
+      setCodigosRegistro(nuevosCodigos);
+      await saveShared("jaralillo-codigos-registro", nuevosCodigos);
     },
-    [perfiles]
+    [perfiles, codigosRegistro]
   );
 
   const reiniciarPin = useCallback(
@@ -452,6 +602,48 @@ export default function App() {
     [perfiles]
   );
 
+  const eliminarAgricultor = useCallback(
+    async (dniEliminar) => {
+      ultimaEdicionRef.current = Date.now();
+      const nuevosAgricultores = { ...agricultores };
+      delete nuevosAgricultores[dniEliminar];
+      setAgricultores(nuevosAgricultores);
+      await saveShared("jaralillo-agricultores", nuevosAgricultores);
+
+      const nuevosPerfiles = { ...perfiles };
+      delete nuevosPerfiles[dniEliminar];
+      setPerfiles(nuevosPerfiles);
+      await saveShared("jaralillo-perfiles", nuevosPerfiles);
+
+      agricultoresCountRef.current = Object.keys(nuevosAgricultores).length;
+      ultimaEdicionRef.current = Date.now();
+    },
+    [agricultores, perfiles]
+  );
+
+  const importarClientes = useCallback(
+    async (lista) => {
+      ultimaEdicionRef.current = Date.now();
+      const nuevo = { ...agricultores };
+      let añadidos = 0;
+      let yaExistian = 0;
+      lista.forEach(({ dni, nombre, poblacion }) => {
+        if (nuevo[dni]) {
+          yaExistian++;
+        } else {
+          nuevo[dni] = { nombre, poblacion: poblacion || "" };
+          añadidos++;
+        }
+      });
+      setAgricultores(nuevo);
+      await saveShared("jaralillo-agricultores", nuevo);
+      agricultoresCountRef.current = Object.keys(nuevo).length;
+      ultimaEdicionRef.current = Date.now();
+      return { añadidos, yaExistian };
+    },
+    [agricultores]
+  );
+
   const actualizarPerfilPersonal = useCallback(
     async (dniP, cambios) => {
       const nuevo = { ...perfiles, [dniP]: { ...(perfiles[dniP] || {}), ...cambios } };
@@ -461,10 +653,18 @@ export default function App() {
     [perfiles]
   );
 
-  const actualizarCodigo = useCallback(async (nuevoCodigo) => {
-    setCodigo(nuevoCodigo);
-    await saveShared("jaralillo-codigo", nuevoCodigo);
-  }, []);
+  const generarCodigoRegistro = useCallback(
+    async (dniPersona) => {
+      ultimaEdicionRef.current = Date.now();
+      const nuevoCodigo = String(Math.floor(1000 + Math.random() * 9000));
+      const nuevo = { ...codigosRegistro, [dniPersona]: nuevoCodigo };
+      setCodigosRegistro(nuevo);
+      await saveShared("jaralillo-codigos-registro", nuevo);
+      ultimaEdicionRef.current = Date.now();
+      return nuevoCodigo;
+    },
+    [codigosRegistro]
+  );
 
   const actualizarPrecios = useCallback(async (nuevo) => {
     setPrecios(nuevo);
@@ -507,6 +707,38 @@ export default function App() {
     ]);
     ultimaEdicionRef.current = Date.now();
   }, []);
+
+  // Vaciado completo: además de lo del día a día, borra también los
+  // agricultores (los de prueba) y el chat. Solo para usar una vez, justo
+  // antes de arrancar la campaña de verdad — no para usar cada temporada.
+  const borrarTodoDeCero = useCallback(async () => {
+    ultimaEdicionRef.current = Date.now();
+    setAgricultores({});
+    setPerfiles({});
+    setAlbaranes({});
+    setAvisos([]);
+    setPedidos([]);
+    setFacturas([]);
+    setKgTotales(0);
+    setPendientes([]);
+    avisosCountRef.current = 0;
+    agricultoresCountRef.current = 0;
+
+    await Promise.all([
+      mensajes.map((m) => borrarMensajeRemoto(m.id)),
+      saveShared("jaralillo-agricultores", {}),
+      saveShared("jaralillo-perfiles", {}),
+      saveShared("jaralillo-albaranes", {}),
+      saveShared("jaralillo-avisos", []),
+      saveShared("jaralillo-pedidos", []),
+      saveShared("jaralillo-facturas-index", []),
+      saveShared("jaralillo-kg-totales", 0),
+      saveShared("jaralillo-albaranes-pendientes", []),
+    ].flat());
+    setMensajes([]);
+    mensajesCountRef.current = 0;
+    ultimaEdicionRef.current = Date.now();
+  }, [mensajes]);
 
   const alternarRevisado = useCallback(
     async (id) => {
@@ -650,6 +882,7 @@ export default function App() {
 
   const crearPedido = useCallback(
     async (autorDni, autorNombre, tipo, cantidad) => {
+      ultimaEdicionRef.current = Date.now();
       const nuevo = [
         {
           id: Date.now(),
@@ -664,12 +897,14 @@ export default function App() {
       ];
       setPedidos(nuevo);
       await saveShared("jaralillo-pedidos", nuevo);
+      ultimaEdicionRef.current = Date.now();
     },
     [pedidos]
   );
 
   const cambiarEstadoPedido = useCallback(
     async (id) => {
+      ultimaEdicionRef.current = Date.now();
       const orden = ["pendiente", "preparado", "entregado"];
       const nuevo = pedidos.map((p) => {
         if (p.id !== id) return p;
@@ -678,6 +913,7 @@ export default function App() {
       });
       setPedidos(nuevo);
       await saveShared("jaralillo-pedidos", nuevo);
+      ultimaEdicionRef.current = Date.now();
     },
     [pedidos]
   );
@@ -709,7 +945,7 @@ export default function App() {
         <LoginAgricultor
           agricultores={agricultores}
           perfiles={perfiles}
-          codigo={codigo}
+          codigosRegistro={codigosRegistro}
           onRegistrar={registrarPerfil}
           onVolver={() => setVista("portal")}
           onEntrar={(d) => {
@@ -741,6 +977,7 @@ export default function App() {
             enviarMensaje(sesion, perfiles[sesion]?.nombre || agricultores[sesion].nombre, "", audioUrl, duracion)
           }
           onPresencia={() => marcarPresencia(sesion)}
+          onActivarNotificaciones={() => activarNotificaciones(sesion)}
           precios={precios}
           pedidos={pedidos.filter((p) => p.dni === sesion)}
           onCrearPedido={(tipo, cantidad) =>
@@ -773,22 +1010,26 @@ export default function App() {
           kgTotales={kgTotales}
           onReiniciarKgTotales={reiniciarKgTotales}
           onEmpezarCampañaNueva={empezarCampañaNueva}
+          onBorrarTodoDeCero={borrarTodoDeCero}
           pendientes={pendientes}
           onAlternarRevisado={alternarRevisado}
           onMarcarTodosPendientes={marcarTodosPendientes}
           onEnviarPendientes={enviarPendientesAAgricultores}
           onSincronizarGuia={sincronizarGuia}
+          onActivarNotificaciones={() => activarNotificaciones(PUESTO_DNI)}
+          onImportarClientes={importarClientes}
           facturas={facturas}
           onSubirFactura={subirFactura}
           onVaciarFacturas={vaciarFacturas}
-          codigo={codigo}
-          onActualizarCodigo={actualizarCodigo}
+          codigosRegistro={codigosRegistro}
+          onGenerarCodigo={generarCodigoRegistro}
           mensajes={mensajes}
           onEliminarMensaje={eliminarMensaje}
           onEnviarMensaje={(texto) => enviarMensaje(PUESTO_DNI, PUESTO_NOMBRE, texto)}
           onEnviarAudio={(audioUrl, duracion) => enviarMensaje(PUESTO_DNI, PUESTO_NOMBRE, "", audioUrl, duracion)}
           perfiles={perfiles}
           onReiniciarPin={reiniciarPin}
+          onEliminarAgricultor={eliminarAgricultor}
           presencia={presencia}
           precios={precios}
           onActualizarPrecios={actualizarPrecios}
@@ -816,10 +1057,6 @@ function Portal({ onAgricultor, onPuesto }) {
       <button style={styles.ghostBtn} onClick={onPuesto}>
         Acceso del puesto
       </button>
-
-      <div style={styles.portalFoot}>
-        Demo funcional · los datos son de ejemplo
-      </div>
     </div>
   );
 }
@@ -827,7 +1064,7 @@ function Portal({ onAgricultor, onPuesto }) {
 // ---------------------------------------------------------------------------
 // Pantalla: login agricultor (DNI + PIN propio; registro con código del puesto)
 // ---------------------------------------------------------------------------
-function LoginAgricultor({ agricultores, perfiles, codigo, onRegistrar, onVolver, onEntrar }) {
+function LoginAgricultor({ agricultores, perfiles, codigosRegistro, onRegistrar, onVolver, onEntrar }) {
   const [paso, setPaso] = useState("dni"); // dni | pin | registro
   const [dni, setDni] = useState("");
   const [pin, setPin] = useState("");
@@ -839,7 +1076,7 @@ function LoginAgricultor({ agricultores, perfiles, codigo, onRegistrar, onVolver
   const comprobarDni = () => {
     const limpio = dni.trim().toUpperCase();
     if (!agricultores[limpio]) {
-      setError("Ese DNI no está registrado en el puesto. Prueba con 12345678A para la demo.");
+      setError("Ese DNI no está registrado en el puesto. Comprueba que esté bien escrito.");
       return;
     }
     setDni(limpio);
@@ -857,8 +1094,8 @@ function LoginAgricultor({ agricultores, perfiles, codigo, onRegistrar, onVolver
   };
 
   const registrarse = () => {
-    if (codigoIntro.trim() !== codigo) {
-      setError("Ese número no es el que ha dado hoy el puesto.");
+    if (codigoIntro.trim() !== codigosRegistro[dni]) {
+      setError("Ese número no coincide con el que te ha dado el puesto para ti.");
       return;
     }
     if (!/^\d{4,6}$/.test(nuevoPin)) {
@@ -947,13 +1184,13 @@ function LoginAgricultor({ agricultores, perfiles, codigo, onRegistrar, onVolver
             {perfiles[dni] ? "Recuperar PIN" : "Primer acceso"}
           </h2>
           <p style={styles.cardHint}>
-            {agricultores[dni]?.nombre} — pregunta en el puesto el número de dos cifras de
-            hoy para {perfiles[dni] ? "poder elegir un PIN nuevo" : "poder registrarte"}.
+            {agricultores[dni]?.nombre} — pídele al puesto tu código personal (te lo tienen
+            que dar a ti en mano, mirando tu cara) para {perfiles[dni] ? "poder elegir un PIN nuevo" : "poder registrarte"}.
           </p>
           <input
             style={styles.input}
             inputMode="numeric"
-            placeholder="Número de dos cifras del puesto"
+            placeholder="Tu código personal"
             value={codigoIntro}
             onChange={(e) => setCodigoIntro(e.target.value)}
           />
@@ -1002,7 +1239,7 @@ function LoginPuesto({ onVolver, onEntrar }) {
       setError("");
       onEntrar();
     } else {
-      setError(`PIN incorrecto. Para la demo usa ${PUESTO_PIN}.`);
+      setError("PIN incorrecto.");
     }
   };
 
@@ -1048,6 +1285,7 @@ function VistaAgricultor({
   onEnviarMensaje,
   onEnviarAudio,
   onPresencia,
+  onActivarNotificaciones,
   tiempoEspera,
   precios,
   pedidos,
@@ -1166,7 +1404,9 @@ function VistaAgricultor({
         <PanelFacturasAgricultor facturas={facturas} onSubirFirmada={onSubirFacturaFirmada} />
       )}
 
-      {tab === "tablon" && <PanelTablon avisos={paraMi} />}
+      {tab === "tablon" && (
+        <PanelTablon avisos={paraMi} onActivarNotificaciones={onActivarNotificaciones} />
+      )}
 
       {tab === "perfil" && (
         <PanelPerfilAgricultor
@@ -1215,7 +1455,7 @@ function FacturaCardAgricultor({ factura: f, onSubirFirmada }) {
     }
   };
 
-  const subirFirmada = (e) => {
+  const subirFirmada = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setError("");
@@ -1224,22 +1464,26 @@ function FacturaCardAgricultor({ factura: f, onSubirFirmada }) {
       e.target.value = "";
       return;
     }
-    if (file.size > 500 * 1024) {
-      setError("El PDF pesa demasiado (máx. 500 KB por ahora).");
+    if (file.size > 8 * 1024 * 1024) {
+      setError("El PDF pesa demasiado (máx. 8 MB).");
       e.target.value = "";
       return;
     }
     setSubiendo(true);
-    const lector = new FileReader();
-    lector.onload = async (ev) => {
-      const resultado = await onSubirFirmada(f.id, file.name, ev.target.result);
+    const ruta = `facturas/${f.dni}/firmadas/${Date.now()}-${file.name}`;
+    const url = await subirArchivoStorage(ruta, file);
+    if (!url) {
       setSubiendo(false);
       e.target.value = "";
-      if (resultado && resultado.ok === false) {
-        setError("No se ha podido guardar el archivo. Prueba con un PDF más ligero.");
-      }
-    };
-    lector.readAsDataURL(file);
+      setError("No se ha podido subir el archivo. Comprueba tu conexión e inténtalo de nuevo.");
+      return;
+    }
+    const resultado = await onSubirFirmada(f.id, file.name, url);
+    setSubiendo(false);
+    e.target.value = "";
+    if (resultado && resultado.ok === false) {
+      setError(`No se ha podido guardar la factura firmada. (${saveShared.ultimoError || "motivo desconocido"})`);
+    }
   };
 
   return (
@@ -1299,20 +1543,60 @@ function FacturaCardAgricultor({ factura: f, onSubirFirmada }) {
   );
 }
 
-function PanelTablon({ avisos }) {
+function BotonActivarNotificaciones({ onActivar }) {
+  const [estado, setEstado] = useState("inicial"); // inicial | pidiendo | activo | error
+  const [motivo, setMotivo] = useState("");
+
+  const activar = async () => {
+    setEstado("pidiendo");
+    setMotivo("");
+    const resultado = await onActivar();
+    if (resultado && resultado.ok) {
+      setEstado("activo");
+    } else {
+      setEstado("error");
+      setMotivo(resultado?.motivo || "No se ha podido activar.");
+    }
+  };
+
+  if (estado === "activo") {
+    return (
+      <p style={styles.notiActivaTexto}>
+        <CheckCircle2 size={14} color="#4E7D3A" /> Avisos activados en este móvil.
+      </p>
+    );
+  }
+
   return (
-    <div style={styles.tablonFondo}>
-      {avisos.length === 0 ? (
-        <p style={styles.emptyText}>No hay avisos del puesto por ahora.</p>
-      ) : (
-        <div style={styles.tablonGrid}>
-          {avisos.map((a) => (
-            <div key={a.id} style={styles.notaTablon}>
-              <AvisoCard aviso={a} />
-            </div>
-          ))}
-        </div>
+    <div style={{ marginBottom: 14 }}>
+      <button style={styles.ghostBtn} onClick={activar} disabled={estado === "pidiendo"}>
+        {estado === "pidiendo" ? <Loader2 size={14} className="animate-spin" /> : <Bell size={14} />}
+        Activar avisos en este móvil
+      </button>
+      {estado === "error" && (
+        <p style={styles.tinyHintLeft}>{motivo}</p>
       )}
+    </div>
+  );
+}
+
+function PanelTablon({ avisos, onActivarNotificaciones }) {
+  return (
+    <div>
+      <BotonActivarNotificaciones onActivar={onActivarNotificaciones} />
+      <div style={styles.tablonFondo}>
+        {avisos.length === 0 ? (
+          <p style={styles.emptyText}>No hay avisos del puesto por ahora.</p>
+        ) : (
+          <div style={styles.tablonGrid}>
+            {avisos.map((a) => (
+              <div key={a.id} style={styles.notaTablon}>
+                <AvisoCard aviso={a} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1603,10 +1887,31 @@ function BotonGrabar({ onGrabado }) {
   const [segundos, setSegundos] = useState(0);
   const [error, setError] = useState("");
   const mediaRecorderRef = useRef(null);
+  const streamRef = useRef(null);
   const chunksRef = useRef([]);
   const segundosRef = useRef(0);
   const intervaloRef = useRef(null);
   const MAX_SEG = 45;
+
+  // Muy importante: si el agricultor/puesto cambia de pantalla con el
+  // micrófono todavía grabando, hay que soltarlo aquí — si no, el
+  // navegador lo deja "ocupado" y la siguiente grabación (en cualquier
+  // zona) deja de funcionar.
+  useEffect(() => {
+    return () => {
+      if (intervaloRef.current) clearInterval(intervaloRef.current);
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {
+          // ya estaba parado, no pasa nada
+        }
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+    };
+  }, []);
 
   const detener = () => {
     if (intervaloRef.current) clearInterval(intervaloRef.current);
@@ -1624,6 +1929,7 @@ function BotonGrabar({ onGrabado }) {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
       chunksRef.current = [];
       segundosRef.current = 0;
       const mr = new MediaRecorder(stream);
@@ -1633,10 +1939,19 @@ function BotonGrabar({ onGrabado }) {
       };
       mr.onstop = () => {
         stream.getTracks().forEach((t) => t.stop());
-        if (chunksRef.current.length === 0) return;
+        streamRef.current = null;
+        if (chunksRef.current.length === 0) {
+          setError("No se ha grabado nada — mantén pulsado un poco más antes de parar.");
+          return;
+        }
         const blob = new Blob(chunksRef.current, { type: mr.mimeType || "audio/webm" });
         const lector = new FileReader();
-        lector.onload = () => onGrabado(lector.result, segundosRef.current);
+        lector.onload = async () => {
+          const resultado = await onGrabado(lector.result, segundosRef.current);
+          if (resultado && resultado.ok === false) {
+            setError("No se ha podido enviar el audio. Vuelve a intentarlo.");
+          }
+        };
         lector.readAsDataURL(blob);
       };
       mr.start();
@@ -1732,27 +2047,31 @@ function VistaPuesto({
   avisos,
   onPublicar,
   onEliminarAviso,
+  onActivarNotificaciones,
   tiempoEspera,
   onActualizarTiempoEspera,
   kgTotales,
   onReiniciarKgTotales,
   onEmpezarCampañaNueva,
+  onBorrarTodoDeCero,
   pendientes,
   onAlternarRevisado,
   onMarcarTodosPendientes,
   onEnviarPendientes,
   onSincronizarGuia,
+  onImportarClientes,
   facturas,
   onSubirFactura,
   onVaciarFacturas,
-  codigo,
-  onActualizarCodigo,
+  codigosRegistro,
+  onGenerarCodigo,
   mensajes,
   onEliminarMensaje,
   onEnviarMensaje,
   onEnviarAudio,
   perfiles,
   onReiniciarPin,
+  onEliminarAgricultor,
   presencia,
   precios,
   onActualizarPrecios,
@@ -1760,7 +2079,7 @@ function VistaPuesto({
   onCambiarEstadoPedido,
   onSalir,
 }) {
-  const [tab, setTab] = useState("avisos"); // avisos | codigo | chat | agricultores | pedidos | revisar
+  const [tab, setTab] = useState("avisos"); // avisos | chat | agricultores | pedidos | revisar
   const [tipo, setTipo] = useState("precio");
   const [mensaje, setMensaje] = useState("");
   const [enviando, setEnviando] = useState(false);
@@ -1815,12 +2134,6 @@ function VistaPuesto({
           <Bell size={14} /> Avisos
         </button>
         <button
-          style={{ ...styles.tabBtn, ...(tab === "codigo" ? styles.tabBtnActivo : {}) }}
-          onClick={() => setTab("codigo")}
-        >
-          <KeyRound size={14} /> Código de registro
-        </button>
-        <button
           style={{ ...styles.tabBtn, ...(tab === "chat" ? styles.tabBtnActivo : {}) }}
           onClick={() => setTab("chat")}
         >
@@ -1858,8 +2171,6 @@ function VistaPuesto({
         </button>
       </div>
 
-      {tab === "codigo" && <PanelCodigo codigo={codigo} onActualizar={onActualizarCodigo} />}
-
       {tab === "facturas" && (
         <PanelFacturasPuesto agricultores={agricultores} facturas={facturas} onSubir={onSubirFactura} onVaciar={onVaciarFacturas} />
       )}
@@ -1869,7 +2180,7 @@ function VistaPuesto({
       )}
 
       {tab === "agricultores" && (
-        <PanelAgricultores agricultores={agricultores} perfiles={perfiles} presencia={presencia} onReiniciarPin={onReiniciarPin} />
+        <PanelAgricultores agricultores={agricultores} perfiles={perfiles} presencia={presencia} onReiniciarPin={onReiniciarPin} onEliminarAgricultor={onEliminarAgricultor} codigosRegistro={codigosRegistro} onGenerarCodigo={onGenerarCodigo} />
       )}
 
       {tab === "revisar" && (
@@ -1881,11 +2192,12 @@ function VistaPuesto({
           onMarcarTodos={onMarcarTodosPendientes}
           onEnviar={onEnviarPendientes}
           onEmpezarCampañaNueva={onEmpezarCampañaNueva}
+          onBorrarTodoDeCero={onBorrarTodoDeCero}
         />
       )}
 
       {tab === "sincronizar" && (
-        <PanelSincronizarGuia agricultores={agricultores} onSincronizar={onSincronizarGuia} />
+        <PanelSincronizarGuia agricultores={agricultores} onSincronizar={onSincronizarGuia} onImportarClientes={onImportarClientes} />
       )}
 
       {tab === "pedidos" && (
@@ -1899,6 +2211,7 @@ function VistaPuesto({
 
       {tab === "avisos" && (
         <>
+      <BotonActivarNotificaciones onActivar={onActivarNotificaciones} />
       <PanelTiempoEsperaPuesto tiempoEspera={tiempoEspera} onActualizar={onActualizarTiempoEspera} />
 
       <p style={{ ...styles.sectionLabel, marginTop: 24 }}>Tipo de aviso</p>
@@ -2005,10 +2318,12 @@ function VistaPuesto({
   );
 }
 
-function PanelAgricultores({ agricultores, perfiles, presencia, onReiniciarPin }) {
+function PanelAgricultores({ agricultores, perfiles, presencia, onReiniciarPin, onEliminarAgricultor, codigosRegistro, onGenerarCodigo }) {
   const CONECTADO_MS = 45000; // se considera "en línea" si avisó en los últimos 45s
   const ahora = Date.now();
   const [confirmando, setConfirmando] = useState(null);
+  const [confirmandoBorrado, setConfirmandoBorrado] = useState(null);
+  const [generando, setGenerando] = useState(null);
 
   const ultimaVezTexto = (ts) => {
     if (!ts) return "Nunca ha entrado";
@@ -2020,18 +2335,28 @@ function PanelAgricultores({ agricultores, perfiles, presencia, onReiniciarPin }
     return `Hace ${Math.floor(horas / 24)} d`;
   };
 
+  const generar = async (dniAg) => {
+    setGenerando(dniAg);
+    await onGenerarCodigo(dniAg);
+    setGenerando(null);
+  };
+
   return (
     <div style={{ marginTop: 20 }}>
       <p style={styles.cardHint}>
         Estado de cada agricultor: si ya se ha registrado con su PIN y si está conectado en
-        la app ahora mismo. Si alguien se queda sin PIN y no puede recuperarlo con el código,
-        puedes reiniciárselo aquí — tendrá que registrarse de nuevo con el código de dos cifras.
+        la app ahora mismo. Para que alguien se registre (o recupere su PIN si lo pierde),
+        pulsa "Generar código" delante de él y dale el número que salga en persona — es de un
+        solo uso y solo sirve para su DNI, así nadie puede hacerse pasar por otro. Si un
+        agricultor ya no trabaja con el puesto, puedes eliminarlo: deja de poder entrar con
+        su DNI, aunque su historial de albaranes y facturas se conserva.
       </p>
       <div style={styles.albaranList}>
         {Object.entries(agricultores).map(([dniAg, datos]) => {
           const registrado = !!perfiles[dniAg];
           const ultimaActividad = presencia[dniAg];
           const conectado = ultimaActividad && ahora - ultimaActividad < CONECTADO_MS;
+          const codigoActivo = codigosRegistro[dniAg];
           return (
             <div key={dniAg} style={styles.albaranRow}>
               <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
@@ -2064,27 +2389,62 @@ function PanelAgricultores({ agricultores, perfiles, presencia, onReiniciarPin }
                   />
                   {conectado ? "En línea ahora" : ultimaVezTexto(ultimaActividad)}
                 </p>
-                {registrado && (
-                  confirmando === dniAg ? (
-                    <div style={styles.confirmarRow}>
-                      <button
-                        style={styles.confirmarBtnSi}
-                        onClick={() => {
-                          onReiniciarPin(dniAg);
-                          setConfirmando(null);
-                        }}
-                      >
-                        Sí, reiniciar
-                      </button>
-                      <button style={styles.confirmarBtnNo} onClick={() => setConfirmando(null)}>
-                        Cancelar
-                      </button>
-                    </div>
-                  ) : (
-                    <button style={styles.linkBtnMini} onClick={() => setConfirmando(dniAg)}>
-                      Reiniciar PIN
+                {codigoActivo && (
+                  <p style={styles.codigoPersonalTexto}>
+                    Código para {datos.nombre.split(" ")[0]}: <strong>{codigoActivo}</strong>
+                  </p>
+                )}
+                {confirmandoBorrado === dniAg ? (
+                  <div style={styles.confirmarRow}>
+                    <button
+                      style={styles.confirmarBtnSi}
+                      onClick={() => {
+                        onEliminarAgricultor(dniAg);
+                        setConfirmandoBorrado(null);
+                      }}
+                    >
+                      Sí, eliminar
                     </button>
-                  )
+                    <button style={styles.confirmarBtnNo} onClick={() => setConfirmandoBorrado(null)}>
+                      Cancelar
+                    </button>
+                  </div>
+                ) : registrado && confirmando === dniAg ? (
+                  <div style={styles.confirmarRow}>
+                    <button
+                      style={styles.confirmarBtnSi}
+                      onClick={() => {
+                        onReiniciarPin(dniAg);
+                        setConfirmando(null);
+                      }}
+                    >
+                      Sí, reiniciar
+                    </button>
+                    <button style={styles.confirmarBtnNo} onClick={() => setConfirmando(null)}>
+                      Cancelar
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+                    <button
+                      style={styles.linkBtnMini}
+                      onClick={() => generar(dniAg)}
+                      disabled={generando === dniAg}
+                    >
+                      {generando === dniAg ? "..." : "Generar código"}
+                    </button>
+                    {registrado && (
+                      <button style={styles.linkBtnMini} onClick={() => setConfirmando(dniAg)}>
+                        Reiniciar PIN
+                      </button>
+                    )}
+                    <button
+                      style={{ ...styles.linkBtnMini, color: "#B4552F" }}
+                      onClick={() => setConfirmandoBorrado(dniAg)}
+                    >
+                      Eliminar
+                    </button>
+                  </div>
                 )}
               </div>
             </div>
@@ -2095,698 +2455,6 @@ function PanelAgricultores({ agricultores, perfiles, presencia, onReiniciarPin }
   );
 }
 
-function PanelSincronizarGuia({ agricultores, onSincronizar }) {
-  const [filas, setFilas] = useState([]);
-  const [error, setError] = useState("");
-  const [nombreArchivo, setNombreArchivo] = useState("");
-  const [guardando, setGuardando] = useState(false);
-  const [resultado, setResultado] = useState(null);
-
-  const procesarArchivo = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setError("");
-    setResultado(null);
-    setNombreArchivo(file.name);
-
-    const lector = new FileReader();
-    lector.onload = (ev) => {
-      try {
-        const wb = XLSX.read(ev.target.result, { type: "array" });
-        const tabla = localizarTablaGuia(wb);
-        if (!tabla) {
-          setError("No encuentro una tabla con columnas de DNI y Kilos en ninguna hoja del archivo.");
-          return;
-        }
-        const { filasDatos, headersReales, precioGlobal } = tabla;
-        const colDni = encontrarColumna(headersReales, ["dni"]);
-        const colKilos = encontrarColumna(headersReales, ["kilo"]);
-        const colPrecio = encontrarColumna(headersReales, ["precio"]);
-        const colN = encontrarColumna(headersReales, ["ticket", "albar", "nº", "numero", "n°"]);
-        const colNombre = encontrarColumna(headersReales, ["agricultor", "nombre", "cliente", "proveedor"]);
-        const colPoblacion = encontrarColumna(headersReales, ["poblac", "municipio", "localidad"]);
-
-        if (!colDni || !colKilos) {
-          setError("He encontrado una tabla pero no distingo bien las columnas de DNI y Kilos.");
-          return;
-        }
-
-        const procesadas = filasDatos
-          .filter((f) => String(f[colDni] || "").trim() !== "" || Number(f[colKilos]) > 0)
-          .map((f, i) => {
-            const dni = String(f[colDni] || "").trim().toUpperCase();
-            const nombreFila = colNombre ? String(f[colNombre] || "").trim() : "";
-            const yaEsCliente = !!agricultores[dni];
-            const kilos = Number(f[colKilos]) || 0;
-            let estado;
-            if (!dni) {
-              estado = kilos > 0 ? "soloKilos" : "sinDatos";
-            } else {
-              estado = yaEsCliente ? "cliente" : nombreFila ? "nuevo" : "sinDatos";
-            }
-            return {
-              dni,
-              nombreFila,
-              poblacionFila: colPoblacion ? String(f[colPoblacion] || "").trim() : "",
-              n: colN && f[colN] !== "" ? Number(f[colN]) : Date.now() + i,
-              kilos,
-              precio: colPrecio && Number(f[colPrecio]) > 0 ? Number(f[colPrecio]) : precioGlobal || 0,
-              estado,
-            };
-          });
-        setFilas(procesadas);
-      } catch {
-        setError("No he podido leer el archivo. Comprueba que es un Excel (.xlsx) o CSV válido.");
-      }
-    };
-    lector.readAsArrayBuffer(file);
-  };
-
-  const sincronizar = async () => {
-    setGuardando(true);
-    const res = await onSincronizar(filas);
-    setGuardando(false);
-    setResultado(res);
-    setFilas([]);
-    setNombreArchivo("");
-  };
-
-  const yaClientes = filas.filter((f) => f.estado === "cliente").length;
-  const nuevosClientes = filas.filter((f) => f.estado === "nuevo").length;
-  const kgSueltos = filas.filter((f) => f.estado === "soloKilos").reduce((s, f) => s + f.kilos, 0);
-
-  return (
-    <div style={{ marginTop: 20 }}>
-      <p style={styles.cardHint}>
-        Sube tu "GUÍA.xlsx" tal cual la generas. Los albaranes van a la carpeta "Por revisar";
-        los kilos sin agricultor se suman al contador de báscula.
-      </p>
-
-      <label style={styles.subirBtn}>
-        <Upload size={16} /> {nombreArchivo || "Subir Excel o CSV de hoy"}
-        <input type="file" accept=".xlsx,.xls,.csv" onChange={procesarArchivo} style={{ display: "none" }} />
-      </label>
-      {error && (
-        <p style={styles.errorText}>
-          <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} /> {error}
-        </p>
-      )}
-
-      {filas.length > 0 && (
-        <>
-          <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
-            <div style={styles.statCard}>
-              <p style={styles.statLabel}>Ya son clientes</p>
-              <p style={styles.statValue}>{yaClientes}</p>
-            </div>
-            <div style={styles.statCard}>
-              <p style={styles.statLabel}>Clientes nuevos</p>
-              <p style={styles.statValue}>{nuevosClientes}</p>
-            </div>
-            {kgSueltos > 0 && (
-              <div style={styles.statCard}>
-                <p style={styles.statLabel}>Kg sin agricultor</p>
-                <p style={styles.statValue}>{kgSueltos.toLocaleString("es-ES")}</p>
-              </div>
-            )}
-          </div>
-
-          <div style={{ ...styles.albaranList, marginTop: 14 }}>
-            {filas.map((f, i) => (
-              <div key={i} style={styles.albaranRow}>
-                <div>
-                  <p style={styles.albaranN}>
-                    {f.estado === "sinDatos"
-                      ? "Fila sin datos suficientes"
-                      : f.estado === "soloKilos"
-                      ? "Kilos de báscula (sin agricultor)"
-                      : agricultores[f.dni]?.nombre || f.nombreFila}
-                  </p>
-                  <p style={styles.albaranFecha}>
-                    {f.estado === "soloKilos"
-                      ? "Se suma al contador de báscula"
-                      : `${f.dni} · nº ${f.n}${f.estado === "nuevo" ? " · cliente nuevo" : ""}`}
-                  </p>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <p style={styles.albaranKilos}>{f.kilos.toLocaleString("es-ES")} kg</p>
-                  {f.estado === "cliente" && <CheckCircle2 size={17} color="#4E7D3A" />}
-                  {f.estado === "nuevo" && <UserPlus size={17} color="#8A5A1F" />}
-                  {f.estado === "soloKilos" && <Scale size={17} color="#5B6E32" />}
-                  {f.estado === "sinDatos" && <AlertTriangle size={17} color="#B4552F" />}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <button
-            style={{ ...styles.primaryBtn, marginTop: 16 }}
-            onClick={sincronizar}
-            disabled={guardando || yaClientes + nuevosClientes + kgSueltos === 0}
-          >
-            {guardando ? <Loader2 size={16} className="animate-spin" /> : <ArrowRight size={16} />}
-            Sincronizar {yaClientes + nuevosClientes} albaranes
-          </button>
-        </>
-      )}
-
-      {resultado && (
-        <div style={{ ...styles.resultadoBox, marginTop: 16 }}>
-          <p style={styles.resultadoTitulo}>
-            <CheckCircle2 size={16} color="#4E7D3A" /> Hecho
-          </p>
-          <p style={styles.resultadoTexto}>
-            {resultado.añadidos} albaranes puestos en "Por revisar"
-            {resultado.clientesNuevos > 0 ? ` · ${resultado.clientesNuevos} clientes nuevos` : ""}
-            {resultado.kgSueltosHoy > 0
-              ? ` · +${resultado.kgSueltosHoy.toLocaleString("es-ES")} kg (total: ${resultado.kgTotalNuevo.toLocaleString("es-ES")} kg)`
-              : ""}
-            . Ve a la pestaña "Por revisar" para aprobarlos.
-          </p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function PanelFacturasPuesto({ agricultores, facturas, onSubir, onVaciar }) {
-  const [dniElegido, setDniElegido] = useState("");
-  const [subiendo, setSubiendo] = useState(false);
-  const [error, setError] = useState("");
-  const [confirmandoVaciar, setConfirmandoVaciar] = useState(false);
-
-  const subirArchivo = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setError("");
-    if (!dniElegido) {
-      setError("Elige primero a qué agricultor pertenece la factura.");
-      e.target.value = "";
-      return;
-    }
-    if (file.type !== "application/pdf") {
-      setError("Solo se admiten archivos PDF.");
-      e.target.value = "";
-      return;
-    }
-    if (file.size > 500 * 1024) {
-      setError("El PDF pesa demasiado (máx. 500 KB por ahora). Comprímelo e inténtalo de nuevo.");
-      e.target.value = "";
-      return;
-    }
-    setSubiendo(true);
-    const lector = new FileReader();
-    lector.onload = async (ev) => {
-      const resultado = await onSubir(dniElegido, file.name, ev.target.result);
-      setSubiendo(false);
-      e.target.value = "";
-      if (resultado && resultado.ok === false) {
-        setError("No se ha podido guardar el archivo. Prueba con un PDF más ligero.");
-      }
-    };
-    lector.readAsDataURL(file);
-  };
-
-  const ordenadas = [...facturas].sort((a, b) => b.fechaSubida - a.fechaSubida);
-
-  return (
-    <div style={{ marginTop: 20 }}>
-      <p style={styles.sectionLabel}>Subir factura</p>
-      <select
-        style={styles.input}
-        value={dniElegido}
-        onChange={(e) => setDniElegido(e.target.value)}
-      >
-        <option value="">Elige un agricultor...</option>
-        {Object.entries(agricultores).map(([dniAg, datos]) => (
-          <option key={dniAg} value={dniAg}>
-            {datos.nombre} — {dniAg}
-          </option>
-        ))}
-      </select>
-      <label style={{ ...styles.subirBtn, opacity: subiendo ? 0.6 : 1 }}>
-        {subiendo ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} />}
-        Subir PDF
-        <input type="file" accept="application/pdf" onChange={subirArchivo} style={{ display: "none" }} disabled={subiendo} />
-      </label>
-      {error && (
-        <p style={styles.errorText}>
-          <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} /> {error}
-        </p>
-      )}
-
-      <div style={styles.avisoEspacioBox}>
-        <p style={styles.tinyHintLeft}>
-          Por ahora las facturas (todas juntas) caben en 1 MB, así que el límite por PDF es de
-          500 KB. Es un paso intermedio — el siguiente cambio (guardar los PDF en el "almacén de
-          archivos" de Firebase) quita esta limitación por completo, sin tocar nada más de la app.
-        </p>
-        {confirmandoVaciar ? (
-          <div style={styles.confirmarRow}>
-            <button
-              style={styles.confirmarBtnSi}
-              onClick={() => {
-                onVaciar();
-                setConfirmandoVaciar(false);
-              }}
-            >
-              Sí, vaciar
-            </button>
-            <button style={styles.confirmarBtnNo} onClick={() => setConfirmandoVaciar(false)}>
-              Cancelar
-            </button>
-          </div>
-        ) : (
-          <button style={styles.linkBtnMini} onClick={() => setConfirmandoVaciar(true)}>
-            Vaciar todas las facturas guardadas
-          </button>
-        )}
-      </div>
-
-      <p style={{ ...styles.sectionLabel, marginTop: 24 }}>Facturas subidas</p>
-      {ordenadas.length === 0 ? (
-        <p style={styles.emptyText}>Todavía no has subido ninguna factura.</p>
-      ) : (
-        <div style={styles.albaranList}>
-          {ordenadas.map((f) => (
-            <FacturaFilaPuesto key={f.id} factura={f} nombreAgricultor={agricultores[f.dni]?.nombre || f.dni} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function FacturaFilaPuesto({ factura: f, nombreAgricultor }) {
-  const [error, setError] = useState("");
-
-  const descargar = (tipo) => {
-    setError("");
-    const url = tipo === "firmada" ? f.dataUrlFirmada : f.dataUrl;
-    if (url) {
-      descargarDataUrl(url, tipo === "firmada" ? `firmada-${f.nombreArchivo}` : f.nombreArchivo);
-    } else {
-      setError("Este archivo no está disponible.");
-    }
-  };
-
-  return (
-    <div style={styles.facturaCard}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div style={{ display: "flex", gap: 10 }}>
-          <FileText size={20} color="#8A5A1F" style={{ flexShrink: 0, marginTop: 2 }} />
-          <div>
-            <p style={styles.albaranN}>{nombreAgricultor}</p>
-            <p style={styles.albaranFecha}>{f.nombreArchivo}</p>
-          </div>
-        </div>
-        <span
-          style={{
-            ...styles.estadoBadge,
-            ...(f.firmada ? styles.estadoBadgeOk : styles.estadoBadgeAviso),
-          }}
-        >
-          {f.firmada ? "Firmada" : "Sin firmar"}
-        </span>
-      </div>
-      <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-        <button style={{ ...styles.ghostBtn, flex: 1 }} onClick={() => descargar("original")}>
-          <Download size={14} /> Original
-        </button>
-        {f.firmada && (
-          <button style={{ ...styles.ghostBtn, flex: 1 }} onClick={() => descargar("firmada")}>
-            <CheckCircle2 size={14} color="#4E7D3A" /> Firmada
-          </button>
-        )}
-      </div>
-      {error && (
-        <p style={styles.errorText}>
-          <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} /> {error}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function PanelRevisarAlbaranes({ kgTotales, onReiniciarKgTotales, pendientes, onAlternar, onMarcarTodos, onEnviar, onEmpezarCampañaNueva }) {
-  const [confirmandoReinicio, setConfirmandoReinicio] = useState(false);
-  const [confirmandoCampaña, setConfirmandoCampaña] = useState(false);
-  const [textoConfirmacion, setTextoConfirmacion] = useState("");
-  const [enviando, setEnviando] = useState(false);
-  const [confirmandoEnvio, setConfirmandoEnvio] = useState(false);
-
-  const revisados = pendientes.filter((p) => p.revisado).length;
-
-  const enviar = async () => {
-    setEnviando(true);
-    await onEnviar();
-    setEnviando(false);
-    setConfirmandoEnvio(false);
-  };
-
-  const confirmarCampaña = () => {
-    if (textoConfirmacion.trim().toUpperCase() !== "BORRAR") return;
-    onEmpezarCampañaNueva();
-    setConfirmandoCampaña(false);
-    setTextoConfirmacion("");
-  };
-
-  return (
-    <div style={{ marginTop: 20 }}>
-      <div style={styles.kgCard}>
-        <p style={styles.kgLabel}>Kilos pesados en báscula puesto</p>
-        <p style={styles.kgValor}>{kgTotales.toLocaleString("es-ES")} kg</p>
-        {confirmandoReinicio ? (
-          <div style={styles.confirmarRow}>
-            <button
-              style={styles.confirmarBtnSi}
-              onClick={() => {
-                onReiniciarKgTotales();
-                setConfirmandoReinicio(false);
-              }}
-            >
-              Sí, poner a 0
-            </button>
-            <button style={styles.confirmarBtnNo} onClick={() => setConfirmandoReinicio(false)}>
-              Cancelar
-            </button>
-          </div>
-        ) : (
-          <button style={styles.linkBtnMini} onClick={() => setConfirmandoReinicio(true)}>
-            Reiniciar contador
-          </button>
-        )}
-      </div>
-
-      <div style={styles.campañaCard}>
-        <p style={styles.kgLabel}>Empezar campaña nueva</p>
-        <p style={styles.tinyHintLeft}>
-          Borra albaranes, pedidos, avisos, kilos y la carpeta de revisión. Mantiene a los
-          agricultores dados de alta (con su DNI, PIN y facturas) — no hace falta que se
-          registren otra vez.
-        </p>
-        {confirmandoCampaña ? (
-          <div style={{ marginTop: 10 }}>
-            <p style={styles.tinyHintLeft}>Escribe BORRAR para confirmar:</p>
-            <input
-              style={{ ...styles.input, marginTop: 6 }}
-              value={textoConfirmacion}
-              onChange={(e) => setTextoConfirmacion(e.target.value)}
-              placeholder="BORRAR"
-            />
-            <div style={styles.confirmarRow}>
-              <button
-                style={{ ...styles.confirmarBtnSi, ...(textoConfirmacion.trim().toUpperCase() !== "BORRAR" ? { opacity: 0.5 } : {}) }}
-                onClick={confirmarCampaña}
-                disabled={textoConfirmacion.trim().toUpperCase() !== "BORRAR"}
-              >
-                Sí, empezar de cero
-              </button>
-              <button
-                style={styles.confirmarBtnNo}
-                onClick={() => {
-                  setConfirmandoCampaña(false);
-                  setTextoConfirmacion("");
-                }}
-              >
-                Cancelar
-              </button>
-            </div>
-          </div>
-        ) : (
-          <button style={{ ...styles.ghostBtn, marginTop: 10, width: "100%" }} onClick={() => setConfirmandoCampaña(true)}>
-            Empezar campaña nueva
-          </button>
-        )}
-      </div>
-
-      <p style={{ ...styles.sectionLabel, marginTop: 24 }}>
-        Albaranes del día por revisar {pendientes.length > 0 ? `(${revisados}/${pendientes.length} revisados)` : ""}
-      </p>
-      <p style={styles.cardHint}>
-        Estos albaranes han llegado de la guía pero todavía NO los ve el agricultor. Marca cada
-        uno como revisado y pulsa "Enviar" — solo se mandan los que estén en verde; los que
-        dejes en pendiente se quedan aquí esperando.
-      </p>
-
-      {pendientes.length > 0 && (
-        <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-          <button style={{ ...styles.tipoBtn, flex: 1 }} onClick={() => onMarcarTodos(true)}>
-            <CheckCircle2 size={13} /> Todos revisados
-          </button>
-          <button style={{ ...styles.tipoBtn, flex: 1 }} onClick={() => onMarcarTodos(false)}>
-            <AlertTriangle size={13} /> Todos pendientes
-          </button>
-        </div>
-      )}
-
-      {pendientes.length === 0 ? (
-        <p style={styles.emptyText}>No hay albaranes esperando revisión.</p>
-      ) : (
-        <div style={styles.albaranList}>
-          {pendientes.map((p) => (
-            <div key={p.id} style={styles.albaranRow}>
-              <div>
-                <p style={styles.albaranN}>{p.nombreAgricultor}</p>
-                <p style={styles.albaranFecha}>
-                  {p.dni} · Albarán nº {p.n} · {fecha(p.fecha)}
-                </p>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <div style={{ textAlign: "right" }}>
-                  <p style={styles.albaranKilos}>{p.kilos.toLocaleString("es-ES")} kg</p>
-                  <p style={styles.albaranPrecio}>{p.precio.toFixed(2)} €/kg</p>
-                </div>
-                <button
-                  style={{
-                    ...styles.estadoToggleBtn,
-                    ...(p.revisado ? styles.estadoToggleOk : styles.estadoTogglePendiente),
-                  }}
-                  onClick={() => onAlternar(p.id)}
-                >
-                  {p.revisado ? "REVISADO" : "PENDIENTE"}
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {pendientes.length > 0 && (
-        <>
-          {confirmandoEnvio ? (
-            <div style={{ ...styles.confirmarRow, justifyContent: "center", marginTop: 16 }}>
-              <button style={styles.confirmarBtnSi} onClick={enviar} disabled={enviando}>
-                {enviando ? <Loader2 size={14} className="animate-spin" /> : "Sí, enviar ya"}
-              </button>
-              <button style={styles.confirmarBtnNo} onClick={() => setConfirmandoEnvio(false)}>
-                Cancelar
-              </button>
-            </div>
-          ) : (
-            <button
-              style={{ ...styles.primaryBtn, marginTop: 18, ...(revisados === 0 ? { opacity: 0.5 } : {}) }}
-              onClick={() => setConfirmandoEnvio(true)}
-              disabled={revisados === 0}
-            >
-              <Send size={16} /> Enviar {revisados} albaranes a los agricultores
-            </button>
-          )}
-          {revisados < pendientes.length && (
-            <p style={styles.tinyHint}>
-              {pendientes.length - revisados} albarán{pendientes.length - revisados === 1 ? "" : "es"} sigue
-              {pendientes.length - revisados === 1 ? "" : "n"} en pendiente y no se enviará
-              {pendientes.length - revisados === 1 ? "" : "n"} hasta que lo marques como revisado.
-            </p>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
-function PanelPedidosPuesto({ precios, onActualizarPrecios, pedidos, onCambiarEstado }) {
-  const [garrafa, setGarrafa] = useState(String(precios.garrafa));
-  const [caja, setCaja] = useState(String(precios.caja));
-  const [guardado, setGuardado] = useState(false);
-
-  const guardarPrecios = () => {
-    const g = parseFloat(garrafa.replace(",", "."));
-    const c = parseFloat(caja.replace(",", "."));
-    if (isNaN(g) || isNaN(c)) return;
-    onActualizarPrecios({ garrafa: g, caja: c });
-    setGuardado(true);
-    setTimeout(() => setGuardado(false), 1800);
-  };
-
-  const ordenados = [...pedidos].sort((a, b) => (b.ts || b.id) - (a.ts || a.id));
-  const etiquetaEstado = { pendiente: "Pendiente", preparado: "Preparado", entregado: "Entregado" };
-
-  return (
-    <div style={{ marginTop: 20 }}>
-      <p style={styles.sectionLabel}>Precio por unidad</p>
-      <div style={{ display: "flex", gap: 10, marginBottom: 8 }}>
-        <div style={{ flex: 1 }}>
-          <p style={styles.tinyLabel}>Garrafa (€)</p>
-          <input
-            style={styles.input}
-            inputMode="decimal"
-            value={garrafa}
-            onChange={(e) => setGarrafa(e.target.value)}
-          />
-        </div>
-        <div style={{ flex: 1 }}>
-          <p style={styles.tinyLabel}>Caja (€)</p>
-          <input
-            style={styles.input}
-            inputMode="decimal"
-            value={caja}
-            onChange={(e) => setCaja(e.target.value)}
-          />
-        </div>
-      </div>
-      <button style={styles.primaryBtn} onClick={guardarPrecios}>
-        Guardar precios
-      </button>
-      {guardado && <p style={styles.tinyHint}>Precios actualizados.</p>}
-
-      <p style={{ ...styles.sectionLabel, marginTop: 28 }}>Pedidos de los agricultores</p>
-      {ordenados.length === 0 ? (
-        <p style={styles.emptyText}>Todavía no hay pedidos.</p>
-      ) : (
-        <div style={styles.albaranList}>
-          {ordenados.map((p) => {
-            const precioUnidad = p.tipo === "garrafa" ? precios.garrafa : precios.caja;
-            const total = precioUnidad * p.cantidad;
-            return (
-              <button
-                key={p.id}
-                style={{ ...styles.albaranRow, cursor: "pointer", border: "none", width: "100%", textAlign: "left" }}
-                onClick={() => onCambiarEstado(p.id)}
-              >
-                <div>
-                  <p style={styles.albaranN}>
-                    {p.nombre} — {p.cantidad} {p.tipo}
-                    {p.cantidad === 1 ? "" : "s"}
-                  </p>
-                  <p style={styles.albaranFecha}>
-                    {new Date(p.ts || p.id).toLocaleString("es-ES", {
-                      day: "2-digit",
-                      month: "short",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}{" "}
-                    · {money(total)}
-                  </p>
-                </div>
-                <span
-                  style={{
-                    ...styles.estadoBadge,
-                    ...(p.estado === "entregado"
-                      ? styles.estadoBadgeOk
-                      : p.estado === "preparado"
-                      ? styles.estadoBadgePreparado
-                      : styles.estadoBadgeAviso),
-                  }}
-                >
-                  {etiquetaEstado[p.estado]}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      )}
-      {ordenados.length > 0 && (
-        <p style={styles.tinyHint}>Toca un pedido para cambiar su estado.</p>
-      )}
-    </div>
-  );
-}
-
-function PanelTiempoEsperaPuesto({ tiempoEspera, onActualizar }) {
-  const [valor, setValor] = useState(tiempoEspera);
-  const [guardado, setGuardado] = useState(false);
-
-  useEffect(() => {
-    setValor(tiempoEspera);
-  }, [tiempoEspera]);
-
-  const ajustar = (delta) => {
-    const nuevo = Math.max(0, valor + delta);
-    setValor(nuevo);
-    onActualizar(nuevo);
-    setGuardado(true);
-    setTimeout(() => setGuardado(false), 1400);
-  };
-
-  return (
-    <div>
-      <p style={styles.sectionLabel}>Tiempo de espera del puesto</p>
-      <EsperaBar minutos={valor} />
-      <div style={styles.cantidadRow}>
-        <button style={styles.cantidadBtn} onClick={() => ajustar(-5)}>
-          −
-        </button>
-        <span style={styles.cantidadValor}>{valor} min</span>
-        <button style={styles.cantidadBtn} onClick={() => ajustar(5)}>
-          +
-        </button>
-      </div>
-      <p style={styles.tinyHint}>
-        {guardado ? "Actualizado — los agricultores ya lo ven." : "Se guarda solo, sin botón."}
-      </p>
-    </div>
-  );
-}
-
-function PanelCodigo({ codigo, onActualizar }) {
-  const [valor, setValor] = useState(codigo);
-  const [guardado, setGuardado] = useState(false);
-
-  const generarNuevo = () => {
-    const random = String(Math.floor(Math.random() * 90) + 10); // 10-99
-    setValor(random);
-    onActualizar(random);
-    setGuardado(true);
-    setTimeout(() => setGuardado(false), 1800);
-  };
-
-  const guardarManual = () => {
-    if (!/^\d{2}$/.test(valor)) return;
-    onActualizar(valor);
-    setGuardado(true);
-    setTimeout(() => setGuardado(false), 1800);
-  };
-
-  return (
-    <div style={{ marginTop: 20 }}>
-      <p style={styles.cardHint}>
-        Solo los agricultores que te pidan este número en persona podrán crear su cuenta y
-        elegir su PIN. Cámbialo cuando quieras.
-      </p>
-      <div style={styles.codigoBox}>{codigo}</div>
-      <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
-        <input
-          style={{ ...styles.input, marginBottom: 0, flex: 1 }}
-          inputMode="numeric"
-          placeholder="Nuevo número (2 cifras)"
-          value={valor}
-          onChange={(e) => setValor(e.target.value)}
-        />
-        <button
-          style={{ ...styles.ghostBtn, width: "auto", padding: "0 16px" }}
-          onClick={guardarManual}
-        >
-          Guardar
-        </button>
-      </div>
-      <button style={{ ...styles.primaryBtn, marginTop: 12 }} onClick={generarNuevo}>
-        Generar número aleatorio
-      </button>
-      {guardado && <p style={styles.tinyHint}>Número actualizado.</p>}
-    </div>
-  );
-}
 
 function PanelChatPuesto({ mensajes, perfiles, onEliminar, onEnviar, onEnviarAudio }) {
   const [texto, setTexto] = useState("");
@@ -3728,6 +3396,14 @@ const styles = {
     color: "#5B5340",
     margin: "6px 0 0",
   },
+  codigoPersonalTexto: {
+    fontSize: 13,
+    color: "#8A5A1F",
+    background: "#F1E4C4",
+    borderRadius: 8,
+    padding: "4px 8px",
+    margin: "6px 0 0",
+  },
   puntoEstado: {
     width: 7,
     height: 7,
@@ -3820,6 +3496,14 @@ const styles = {
     color: "#3A3123",
     lineHeight: 1.5,
     margin: 0,
+  },
+  notiActivaTexto: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 12.5,
+    color: "#3F5A25",
+    marginBottom: 14,
   },
   borrarAvisoBtn: {
     position: "absolute",
